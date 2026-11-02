@@ -1030,6 +1030,8 @@ static hcd_pipe_event_t _intr_hdlr_chan(pipe_t *pipe, usb_dwc_hal_chan_t *chan_o
         _buffer_done(pipe, stop_idx, HCD_PIPE_EVENT_NONE, true);
         // Parse the buffer
         _buffer_parse(pipe);
+        // The commanded halt is complete, so the pipe is no longer waiting on it
+        pipe->cs_flags.waiting_halt = 0;
         // Notify the task waiting for the pipe halt
         *yield |= _internal_pipe_event_notify(pipe, true);
         break;
