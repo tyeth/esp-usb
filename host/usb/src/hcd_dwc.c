@@ -2790,8 +2790,14 @@ static inline void _buffer_parse_error(dma_buffer_block_t *buffer)
     case HCD_PIPE_EVENT_ERROR_STALL:
         transfer->status = USB_TRANSFER_STATUS_STALL;
         break;
+    case HCD_PIPE_EVENT_ERROR_URB_NOT_AVAIL:
+        // The channel raised BNA (Buffer Not Available): it fetched a QTD whose active bit was clear.
+        // The ERROR branch of the channel interrupt handler parses the buffer like any other channel
+        // error, so fail the URB rather than aborting in interrupt context.
+        transfer->status = USB_TRANSFER_STATUS_ERROR;
+        break;
     default:
-        // HCD_PIPE_EVENT_URB_DONE and HCD_PIPE_EVENT_ERROR_URB_NOT_AVAIL should not occur here
+        // HCD_PIPE_EVENT_URB_DONE should not occur here
         abort();
         break;
     }
