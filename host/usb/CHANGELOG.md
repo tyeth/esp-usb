@@ -6,10 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Added optional dynamic host channel binding (`CONFIG_USB_HOST_DYNAMIC_CHAN_BINDING`, disabled by default). Control and bulk pipes bind a Host Controller channel only while they have transfers enqueued, so idle pipes no longer exhaust the channels when external hubs and composite devices are connected. Optional parked-listener scheduling (`CONFIG_USB_HOST_PARKED_IN_BIND_CAP` and related options) caps and rotates the channels held by pipes that keep small IN reads posted, such as serial consoles.
+
 ### Fixed
 
 - Fixed a device object and HCD channel leak when the enumeration filter rejects a device connected through an external hub (https://github.com/espressif/esp-usb/pull/590).
 - Fixed possible OOB read during string descriptor print
+- Fixed an `abort()` in the channel interrupt handler when a channel reports a BNA (Buffer Not Available) error. The transfer now completes with `USB_TRANSFER_STATUS_ERROR`.
+- Fixed the HCD pipe's `waiting_halt` flag never being cleared after a commanded halt completed
 
 ## [1.6.0] - 2026-10-05
 
