@@ -79,7 +79,7 @@ The HCD (Host Controller Driver) abstracts the DWC_OTG as N number of ports and 
 The HCD currently has the following limitations:
 
 - HCD **does not "present the root hub and its behavior according to the hub class definition"**. We currently don't have a hub driver yet, so the port commands in the driver do not fully represent an interface of a USB hub as described in 10.4 of the USB2.0 spec.
-- No more than 8 (or 16 on ESP32-P4) pipes can be allocated at any one time due to underlying Host Controllers 8 channel limit. In the future, we could make particular pipes share a single Host Controller channel.
+- No more than 8 (or 16 on ESP32-P4) pipes can be allocated at any one time due to underlying Host Controllers 8 channel limit, unless `CONFIG_USB_HOST_DYNAMIC_CHAN_BINDING` is enabled (see [HCD Dynamic Channel Binding](#hcd-dynamic-channel-binding)).
 
 ## HCD Port
 
@@ -107,6 +107,26 @@ The HCD currently has the following limitations:
 - URBs need to have the transfer information (such as data buffer, transfer length in bytes) filled before they should be enqueued.
 - URBs will be owned by the HCD until they are dequeued. Thus, users should not attempt to modify a URB object (and the URB's data buffer) until the URB is dequeued.
 - The URB is defined in `usb_private.h` instead of `hcd.h` so that the same structure can shared throughout the entire Host stack. Each layer simply needs to pass the pointer of the URB to the next layer thus minimizing the amount of copying required.
+
+## HCD Dynamic Channel Binding
+
+By default every pipe allocates a Host Controller channel in `hcd_pipe_alloc()` and keeps it until `hcd_pipe_free()`, so every open pipe costs a channel even while idle: the default pipe of every enumerated device, the interrupt pipe of every external hub, and every endpoint of every claimed interface. With external hubs and composite devices the channels run out while most pipes are idle, and `hcd_pipe_alloc()` fails with `ESP_ERR_NOT_SUPPORTED`. `CONFIG_USB_HOST_DYNAMIC_CHAN_BINDING` (disabled by default) treats the channels as a pool instead, which is also how the Linux dwc2 driver uses them.
+
+- **Binding on demand.** A CTRL or BULK pipe does not take a channel in `hcd_pipe_alloc()`. The channel is bound (allocated, endpoint characteristics programmed, data toggle restored) when work is enqueued, and unbound when the pipe goes idle (its last URB is dequeued). `pipe->chan_bound` tracks this; statically bound pipes have it set for their whole life.
+- **Waiter queue.** A pipe that finds no free channel joins the port's FIFO channel-waiter queue, and its URBs stay pending. Whenever a channel is released (a pipe going idle or being freed), `_port_chan_waiters_kick()` binds the oldest waiter and fills/executes its buffers. Channel exhaustion becomes queuing instead of an error for these pipes.
+- **Data toggle.** The channel's `HCTSIZ.PID` is saved into the pipe at unbind and programmed at bind. Control transfers always start with a SETUP (DATA0).
+- **Unbound pipes.** A halt of an unbound pipe is a pure state change (there is no channel to halt). Clearing an unbound pipe that has work binds a channel or joins the waiter queue. `_port_reset_all_pipes()`, `hcd_pipe_update_mps()` and `hcd_pipe_update_dev_addr()` program the channel only when bound; otherwise the stored endpoint characteristics are programmed at the next bind.
+- All bind, unbind and waiter-queue operations run inside the HCD critical section, in the contexts that already fill and execute buffers.
+
+### Parked listeners
+
+A bulk IN pipe that keeps reads posted (e.g., a CDC-ACM console) holds its channel while it waits for data, and its channel NAK-polls the bus continuously. Enough of them exhaust the channels and saturate a Full-Speed bus. `CONFIG_USB_HOST_PARKED_IN_BIND_CAP` (0 by default, which disables everything in this section) limits how many such "parked listeners" hold channels at once and rotates the channels among them:
+
+- **Classification.** A bulk IN pipe is a parked listener when its next transfer is at most `CONFIG_USB_HOST_PARKED_IN_MAX_PACKETS` max-size packets and it has at least two reads queued. The queue depth rule keeps one-off small reads (e.g., a mass storage CSW) out of the class. A pipe that binds before it qualifies (e.g., a driver posting its reads one by one) is promoted when it does.
+- **Cap and reserve.** A parked listener is refused a channel when the cap is reached, or when no more than `CONFIG_USB_HOST_PARKED_IN_CHAN_RESERVE` channels are free. The refused pipe waits in the waiter queue without blocking the waiters behind it. The reserve keeps channels for statically allocated pipes (e.g., the interrupt pipes of an interface being claimed), whose allocation fails outright when no channel is free.
+- **Rotation.** A per-port `esp_timer` tick (`CONFIG_USB_HOST_PARKED_IN_ROTATE_MS`) runs once a pipe has waited for a channel or a parked count has gone above its cap. While a pipe waits, or a parked count is above its cap, each tick asks one parked listener to yield its channel, round-robin. The tick skips the yield while a non-parked bulk transfer (e.g., mass storage data) is executing.
+- **Yield.** The yield is a channel halt flagged by `pipe->pause_pending`, finished in the `HALT_REQ` case of `_intr_hdlr_chan()`. If whole packets were already received, the URB completes as a short read. With zero progress, the buffer's descriptors are re-armed (the halt may have written the in-progress QTD back, and re-executing it would raise BNA) so that the buffer re-executes on rebind. The pipe then unbinds, rejoins the tail of the waiter queue, and the channel goes to the oldest waiter. A commanded halt (`cs_flags.waiting_halt`) always takes precedence over a yield. Only parked-size IN reads are ever yielded.
+- **Interrupt IN listeners.** With `CONFIG_USB_HOST_PARKED_INTR_BIND_CAP` > 0, INTR IN pipes also bind on demand. Single-packet ones (hub status change and CDC-ACM notification endpoints) are parked listeners with their own cap, share the channel reserve and rotate with the bulk listeners; the channel's frame list entry is released at unbind and programmed again at bind. Hub status changes are latched by the hub until read, so rotation delays their detection without losing them.
 
 ## HCD SW Arch
 

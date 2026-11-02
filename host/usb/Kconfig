@@ -12,6 +12,100 @@ menu "USB-OTG"
             - The maximum length of control transfers is limited
             - Device's with configuration descriptors larger than this limit cannot be supported
 
+    menu "Host channel allocation"
+
+        config USB_HOST_DYNAMIC_CHAN_BINDING
+            bool "Bind host channels on demand (experimental)"
+            default n
+            help
+                The USB-DWC controller has a small, fixed number of host channels (e.g., 16 on the High-Speed
+                controller of the ESP32-P4 and ESP32-S31). By default, every open pipe holds a channel for its whole
+                lifetime: the default endpoint of every connected device, the interrupt endpoint of every external
+                hub and every endpoint of every claimed interface. With external hubs and composite devices the
+                channels run out while most pipes are idle, and claiming an interface then fails with
+                ESP_ERR_NOT_SUPPORTED.
+
+                When enabled, control and bulk pipes bind a channel only while they have transfers enqueued, and
+                release it when they go idle. When no channel is free, the pipe waits in a queue and its transfers
+                stay pending until a channel is released. Interrupt and isochronous pipes keep their channel for
+                their whole lifetime (see USB_HOST_PARKED_INTR_BIND_CAP for interrupt IN pipes).
+
+                A bulk IN pipe that keeps a read posted (e.g., a serial console) still holds its channel while it
+                waits for data. See USB_HOST_PARKED_IN_BIND_CAP to share channels between such pipes.
+
+                When disabled, channels are allocated statically, as in previous releases.
+
+        config USB_HOST_PARKED_IN_BIND_CAP
+            int "Max parked bulk IN listeners holding channels (0 = no limit, rotation disabled)"
+            depends on USB_HOST_DYNAMIC_CHAN_BINDING
+            default 0
+            range 0 16
+            help
+                A parked listener is a bulk IN pipe that keeps several small reads posted (each at most
+                USB_HOST_PARKED_IN_MAX_PACKETS max-size packets, with at least two reads queued), such as a
+                CDC-ACM serial console waiting for data. While such a pipe holds a channel, the controller polls
+                the device continuously, and enough of them saturate a Full-Speed bus.
+
+                When set to N > 0, at most N parked listeners hold channels at once. The others wait in the channel
+                queue, and a periodic tick (USB_HOST_PARKED_IN_ROTATE_MS) asks one parked listener at a time to
+                give up its channel, so that every listener still gets regular bus time. A parked listener that
+                gives up its channel in the middle of a transfer completes the packets already received as a short
+                read. Larger transfers (e.g., mass storage data) are never limited or interrupted.
+
+                0 disables parked-listener handling: no limit and no rotation.
+
+        config USB_HOST_PARKED_IN_ROTATE_MS
+            int "Parked listener rotation period (ms)"
+            depends on USB_HOST_DYNAMIC_CHAN_BINDING && USB_HOST_PARKED_IN_BIND_CAP != 0
+            default 100
+            range 5 1000
+            help
+                Period of the tick that asks one parked listener to give up its channel while other pipes wait
+                for a channel, or while more parked listeners than USB_HOST_PARKED_IN_BIND_CAP hold channels. At
+                most one parked listener gives up its channel per tick, and the tick does nothing while a
+                non-parked bulk transfer is executing. The worst-case extra latency for a parked listener is
+                roughly (number of waiting listeners) x this period.
+
+        config USB_HOST_PARKED_IN_MAX_PACKETS
+            int "Max packets of a bulk IN read for a parked listener"
+            depends on USB_HOST_DYNAMIC_CHAN_BINDING && USB_HOST_PARKED_IN_BIND_CAP != 0
+            default 4
+            range 1 16
+            help
+                A bulk IN read counts as a parked listener read when its length is at most this many max-size
+                packets. Console drivers post reads of a few packets (e.g., Linux cdc-acm posts 2 x MPS reads),
+                while mass storage data transfers are far larger.
+
+        config USB_HOST_PARKED_IN_CHAN_RESERVE
+            int "Host channels reserved from parked listeners"
+            depends on USB_HOST_DYNAMIC_CHAN_BINDING && USB_HOST_PARKED_IN_BIND_CAP != 0
+            default 0
+            range 0 8
+            help
+                A parked listener (bulk or interrupt) may only bind a channel while MORE than this many channels
+                are free, so the last channels stay available to pipes that are allocated statically (e.g.,
+                interrupt pipes when a device's interface is claimed), whose allocation fails outright when no
+                channel is free. Other pipes may use the reserved channels.
+
+        config USB_HOST_PARKED_INTR_BIND_CAP
+            int "Max parked interrupt IN listeners holding channels (0 = interrupt pipes bound statically)"
+            depends on USB_HOST_DYNAMIC_CHAN_BINDING && USB_HOST_PARKED_IN_BIND_CAP != 0
+            default 0
+            range 0 16
+            help
+                When set to N > 0, interrupt IN pipes also bind a channel only while they have transfers
+                enqueued. A parked interrupt listener is an interrupt IN pipe whose transfer is a single packet
+                (e.g., a hub status change endpoint or a CDC-ACM notification endpoint). At most N of them hold
+                channels at once, and they are rotated with the parked bulk IN listeners. Other interrupt IN
+                pipes bind without a limit and are never rotated.
+
+                A rotated-out listener polls its endpoint less often. Hub status changes are latched by the hub
+                until they are read, so their detection is delayed but not lost.
+
+                0 keeps every interrupt pipe bound statically.
+
+    endmenu #Host channel allocation
+
     choice USB_HOST_HW_BUFFER_BIAS
         prompt "Hardware FIFO size biasing"
         default USB_HOST_HW_BUFFER_BIAS_BALANCED
